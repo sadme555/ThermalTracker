@@ -1,3 +1,11 @@
+'''
+管理数据集RGBT-Tinyd的配置:
+1.数据集的根目录
+2.图像路径
+3.标注路径
+4.划分文件路径
+'''
+
 import os
 from pathlib import Path
 
@@ -13,7 +21,6 @@ class RGBTinyConfig:
         self.test_split = self.split_path / "test.txt"
         
     def get_image_paths(self, split='train'):
-        """根据划分获取图片路径"""
         if split == 'train':
             split_file = self.train_split
         else:
@@ -24,8 +31,6 @@ class RGBTinyConfig:
             
         image_paths = []
         for img_name in image_names:
-            # 根据你的数据集结构调整路径
-            # 假设图片路径格式为: DJI_0022_1/00/xxxx.jpg
             img_path = self.image_path / img_name
             if img_path.exists():
                 image_paths.append(str(img_path))
@@ -33,7 +38,6 @@ class RGBTinyConfig:
         return image_paths
 
     def check_paths(self):
-        """检查所有路径是否存在"""
         paths = {
             'root': self.root_path,
             'images': self.image_path,
@@ -49,7 +53,6 @@ class RGBTinyConfig:
                 print(f"  内容: {[item.name for item in items[:3]]}")
 
     def get_annotation_path(self, split='train'):
-        """获取标注文件路径"""
         if split == 'train':
             return str(self.annotation_path / "instances_00_train2017.json")
         else:

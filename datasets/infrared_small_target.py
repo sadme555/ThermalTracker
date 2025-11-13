@@ -1,16 +1,15 @@
-# datasets/infrared_small_target.py
 """
-红外小目标数据集加载器 - 修复导入问题
+红外小目标数据集加载器
 """
 
+import os
 import torch
 import torch.utils.data
 from pycocotools.coco import COCO
-import os
 from PIL import Image
-import torchvision.transforms as T
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+import torchvision.transforms as T
 
 # 导入配置
 try:
@@ -38,7 +37,6 @@ class InfraredSmallTargetDataset(torch.utils.data.Dataset):
     def __init__(self, config: Config, is_train: bool = True):
         """
         初始化数据集
-        
         Args:
             config: 配置对象
             is_train: 是否为训练模式

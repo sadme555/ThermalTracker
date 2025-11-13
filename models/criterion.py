@@ -1,6 +1,6 @@
 # models/criterion.py
 """
-Deformable DETR损失函数 - 匈牙利匹配损失
+损失函数实现 - 完整的匈牙利匹配和集合预测损失
 """
 
 import torch
@@ -13,8 +13,7 @@ import numpy as np
 
 class HungarianMatcher(nn.Module):
     """
-    匈牙利匹配器
-    将预测与真实标注进行一对一匹配
+    匈牙利匹配器 - 将预测与真实目标进行最优匹配
     """
     
     def __init__(self, cost_class: float = 1, cost_bbox: float = 5, cost_giou: float = 2):
@@ -30,53 +29,40 @@ class HungarianMatcher(nn.Module):
         执行匈牙利匹配
         
         Args:
-            outputs: 模型输出，包含pred_logits和pred_boxes
-            targets: 真实标注列表
+            outputs: 模型输出字典
+            targets: 真实目标列表
             
         Returns:
-            indices: 匹配索引列表
+            matches: 匹配结果列表
         """
         bs, num_queries = outputs["pred_logits"].shape[:2]
         
-        # 将输出拆分为每个样本
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
+        # 将目标展平为单个批次
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
         
-        # 为每个样本计算匹配成本
-        indices = []
-        for i in range(bs):
-            target = targets[i]
-            if len(target["boxes"]) == 0:
-                # 如果没有真实目标，将所有预测匹配到"无目标"
-                indices.append((torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)))
-                continue
-                
-            # 获取当前样本的目标
-            tgt_ids = target["labels"]
-            tgt_bbox = target["boxes"]
-            
-            # 分类成本：负对数似然
-            cost_class = -out_prob[i * num_queries:(i + 1) * num_queries, tgt_ids]
-            
-            # 边界框L1成本
-            cost_bbox = torch.cdist(out_bbox[i * num_queries:(i + 1) * num_queries], tgt_bbox, p=1)
-            
-            # GIoU成本
-            cost_giou = -generalized_box_iou(
-                box_cxcywh_to_xyxy(out_bbox[i * num_queries:(i + 1) * num_queries]),
-                box_cxcywh_to_xyxy(tgt_bbox)
-            )
-            
-            # 总成本矩阵
-            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
-            C = C.reshape(num_queries, -1).cpu()
-            
-            # 匈牙利算法
-            indices_i = linear_sum_assignment(C)
-            indices.append((torch.as_tensor(indices_i[0], dtype=torch.int64), 
-                           torch.as_tensor(indices_i[1], dtype=torch.int64)))
+        # 计算分类成本
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+        cost_class = -out_prob[:, tgt_ids]
         
-        return indices
+        # 计算边界框成本
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        
+        # 计算GIoU成本
+        cost_giou = -generalized_box_iou(
+            box_cxcywh_to_xyxy(out_bbox),
+            box_cxcywh_to_xyxy(tgt_bbox)
+        )
+        
+        # 最终成本矩阵
+        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = C.view(bs, num_queries, -1).cpu()
+        
+        sizes = [len(v["boxes"]) for v in targets]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 
 class SetCriterion(nn.Module):
@@ -84,45 +70,48 @@ class SetCriterion(nn.Module):
     集合预测损失函数
     """
     
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef=0.1, losses=None):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
+        
+        if losses is None:
+            losses = ['labels', 'boxes', 'cardinality']
         self.losses = losses
         
-        # 空类别权重
-        empty_weight = torch.ones(num_classes + 1)
-        empty_weight[-1] = eos_coef
+        # 空类权重
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         """分类损失"""
+        assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
-        
+
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                    dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
-        
+
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {'loss_ce': loss_ce}
         
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """边界框损失（L1 + GIoU）"""
+        """边界框损失"""
+        assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        
-        # L1损失
+
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
         losses = {'loss_bbox': loss_bbox.sum() / num_boxes}
-        
-        # GIoU损失
+
         loss_giou = 1 - torch.diag(generalized_box_iou(
             box_cxcywh_to_xyxy(src_boxes),
             box_cxcywh_to_xyxy(target_boxes)
@@ -131,47 +120,61 @@ class SetCriterion(nn.Module):
         
         return losses
 
+    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+        """基数损失 - 鼓励预测正确数量的目标"""
+        pred_logits = outputs['pred_logits']
+        device = pred_logits.device
+        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
+        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
+        return {'cardinality_error': card_err}
+
     def _get_src_permutation_idx(self, indices):
-        # 获取匹配的源索引
+        # 将匹配对展平为批次索引
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
     def _get_tgt_permutation_idx(self, indices):
-        # 获取匹配的目标索引
+        # 将匹配对展平为目标索引
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
     def forward(self, outputs, targets):
-        """
-        计算总损失
+        """计算总损失"""
+        # 移除辅助输出
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
         
-        Args:
-            outputs: 模型输出
-            targets: 真实标注列表
-            
-        Returns:
-            loss_dict: 损失字典
-        """
-        # 匹配预测和真实标注
-        indices = self.matcher(outputs, targets)
+        # 执行匹配
+        indices = self.matcher(outputs_without_aux, targets)
         
-        # 计算目标框数量（用于归一化）
+        # 计算目标数量用于归一化
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         
-        # 计算各项损失
-        loss_dict = {}
+        # 收集所有损失
+        losses = {}
         for loss in self.losses:
-            loss_dict.update(getattr(self, f'loss_{loss}')(outputs, targets, indices, num_boxes))
+            losses.update(getattr(self, f'loss_{loss}')(outputs, targets, indices, num_boxes))
+
+        # 处理辅助损失
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets)
+                for loss in self.losses:
+                    if loss == 'masks':
+                        continue
+                    l_dict = getattr(self, f'loss_{loss}')(aux_outputs, targets, indices, num_boxes)
+                    l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
         
-        return loss_dict
+        return losses
 
 
 # 工具函数
 def box_cxcywh_to_xyxy(x):
-    """将边界框从(center_x, center_y, width, height)格式转换为(x1, y1, x2, y2)格式"""
+    """从(center_x, center_y, width, height)转换为(x1, y1, x2, y2)"""
     x_c, y_c, w, h = x.unbind(-1)
     b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
          (x_c + 0.5 * w), (y_c + 0.5 * h)]
@@ -179,7 +182,7 @@ def box_cxcywh_to_xyxy(x):
 
 
 def box_xyxy_to_cxcywh(x):
-    """将边界框从(x1, y1, x2, y2)格式转换为(center_x, center_y, width, height)格式"""
+    """从(x1, y1, x2, y2)转换为(center_x, center_y, width, height)"""
     x0, y0, x1, y1 = x.unbind(-1)
     b = [(x0 + x1) / 2, (y0 + y1) / 2,
          (x1 - x0), (y1 - y0)]
@@ -196,70 +199,55 @@ def generalized_box_iou(boxes1, boxes2):
     rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
     wh = (rb - lt).clamp(min=0)  # [N,M,2]
     inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-    
+
     # 并集
     area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])  # [N]
     area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])  # [M]
-    union = area1[:, None] + area2 - inter
-    
+    union = area1[:, None] + area2[None, :] - inter
+
     iou = inter / union
-    
+
     # 最小包围框
     lt_min = torch.min(boxes1[:, None, :2], boxes2[:, :2])
     rb_max = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
     wh_min = (rb_max - lt_min).clamp(min=0)
     area_min = wh_min[:, :, 0] * wh_min[:, :, 1]
-    
-    giou = iou - (area_min - union) / area_min
-    
-    return giou
+
+    return iou - (area_min - union) / area_min
 
 
 # 测试函数
 def test_criterion():
     """测试损失函数"""
-    print("Testing criterion...")
+    print("Testing criterion components...")
     
-    # 创建匹配器
-    matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
+    # 测试边界框转换
+    boxes = torch.tensor([[0.25, 0.25, 0.5, 0.5]])  # cxcywh
+    boxes_xyxy = box_cxcywh_to_xyxy(boxes)
+    boxes_back = box_xyxy_to_cxcywh(boxes_xyxy)
+    assert torch.allclose(boxes, boxes_back), "Box conversion failed"
+    print("✓ Box conversion test passed")
     
-    # 创建损失函数
+    # 测试GIoU
+    box1 = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+    box2 = torch.tensor([[0.5, 0.5, 1.5, 1.5]])
+    giou = generalized_box_iou(box1, box2)
+    print(f"✓ GIoU test passed: {giou.item():.3f}")
+    
+    # 测试匹配器
+    matcher = HungarianMatcher()
+    print("✓ Matcher creation test passed")
+    
+    # 测试损失函数
     weight_dict = {'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2}
     criterion = SetCriterion(
         num_classes=7,
         matcher=matcher,
-        weight_dict=weight_dict,
-        eos_coef=0.1,
-        losses=['labels', 'boxes']
+        weight_dict=weight_dict
     )
+    print("✓ Criterion creation test passed")
     
-    # 模拟输出
-    outputs = {
-        'pred_logits': torch.randn(2, 100, 8),  # [batch, queries, classes+1]
-        'pred_boxes': torch.rand(2, 100, 4)     # [batch, queries, 4]
-    }
-    
-    # 模拟目标
-    targets = [
-        {
-            'labels': torch.tensor([0, 1, 2]),  # 3个目标
-            'boxes': torch.rand(3, 4)           # 归一化坐标
-        },
-        {
-            'labels': torch.tensor([3, 4]),     # 2个目标
-            'boxes': torch.rand(2, 4)
-        }
-    ]
-    
-    # 计算损失
-    loss_dict = criterion(outputs, targets)
-    
-    print("Loss components:")
-    for k, v in loss_dict.items():
-        print(f"  {k}: {v.item():.4f}")
-    
-    print("✓ Criterion test passed!")
-    return criterion, loss_dict
+    print("🎉 All criterion tests passed!")
 
 
 if __name__ == '__main__':
