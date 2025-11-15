@@ -13,4 +13,5 @@ mkdir annotations_coco data_split images
 7.conda install pytorch=1.5.1 torchvision=0.6.1 cudatoolkit=9.2 -c pytorch
 8.pip install -r requirements.txt
 
+python main.py --mode train --config configs/default.yaml
 

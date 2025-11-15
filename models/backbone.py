@@ -1,13 +1,13 @@
-# models/backbone.py
 """
-红外小目标检测骨干网络 - 统一修复版本
-基于ResNet，完全控制各层以避免通道不匹配问题
+红外小目标检测骨干网络 - 完整修复版本
+包含所有必要的类定义
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+import math
 from typing import Dict, List
 
 from .backbone_config import BackboneConfig
@@ -29,6 +29,108 @@ class InfraredAdaptation(nn.Module):
 
     def forward(self, x):
         return self.adapter(x)
+
+
+class PositionEmbeddingSine(nn.Module):
+    """
+    正弦位置编码
+    """
+    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
+        super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+        if scale is None:
+            scale = 2 * math.pi
+        self.scale = scale
+
+    def forward(self, x, mask=None):
+        if mask is None:
+            mask = torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool)
+        not_mask = ~mask
+        y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if self.normalize:
+            eps = 1e-6
+            y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
+            x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+
+        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, None] / dim_t
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
+        return pos
+
+
+class Joiner(nn.Sequential):
+    """连接骨干网络和位置编码"""
+    
+    def __init__(self, backbone, position_embedding):
+        super().__init__(backbone, position_embedding)
+
+    def forward(self, x, mask=None):
+        features = self[0](x)
+        pos = []
+        for feature in features.values():
+            pos.append(self[1](feature, mask).to(feature.dtype))
+        return features, pos
+
+
+class FeaturePyramidNetwork(nn.Module):
+    """
+    特征金字塔网络
+    用于多尺度特征融合，特别适合小目标检测
+    """
+    
+    def __init__(self, channel_list, out_channels=256):
+        super().__init__()
+        self.out_channels = out_channels
+        
+        # 横向连接（1x1卷积降维）
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(channel, out_channels, 1) 
+            for channel in channel_list
+        ])
+        
+        # 融合卷积（3x3卷积细化特征）
+        self.fusion_convs = nn.ModuleList([
+            nn.Conv2d(out_channels, out_channels, 3, padding=1)
+            for _ in range(len(channel_list))
+        ])
+
+    def forward(self, features):
+        """
+        输入: 特征字典 {'0': c3, '1': c4, '2': c5}
+        输出: 增强后的特征字典，所有特征图通道数相同
+        """
+        # 提取各层特征
+        c3, c4, c5 = features['0'], features['1'], features['2']
+        
+        # 自上而下的特征融合
+        p5 = self.lateral_convs[2](c5)  # 最顶层
+        
+        # p4 = c4 + 上采样的p5
+        p4 = self.lateral_convs[1](c4) + F.interpolate(
+            p5, size=c4.shape[-2:], mode='nearest'
+        )
+        
+        # p3 = c3 + 上采样的p4  
+        p3 = self.lateral_convs[0](c3) + F.interpolate(
+            p4, size=c3.shape[-2:], mode='nearest'
+        )
+        
+        # 融合卷积细化特征
+        p3 = self.fusion_convs[0](p3)
+        p4 = self.fusion_convs[1](p4)
+        p5 = self.fusion_convs[2](p5)
+        
+        return {'0': p3, '1': p4, '2': p5}
 
 
 class Backbone(nn.Module):
@@ -103,60 +205,6 @@ class Backbone(nn.Module):
             features = self.fpn(features)
         
         return features
-
-
-class FeaturePyramidNetwork(nn.Module):
-    """
-    特征金字塔网络
-    用于多尺度特征融合，特别适合小目标检测
-    """
-    
-    def __init__(self, channel_list, out_channels=256):
-        super().__init__()
-        self.out_channels = out_channels
-        
-        # 横向连接（1x1卷积降维）
-        self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(channel, out_channels, 1) 
-            for channel in channel_list
-        ])
-        
-        # 融合卷积（3x3卷积细化特征）
-        self.fusion_convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(out_channels, out_channels, 3, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
-            ) for _ in channel_list
-        ])
-
-    def forward(self, features):
-        """
-        输入: 特征字典 {'0': c3, '1': c4, '2': c5}
-        输出: 增强后的特征字典，所有特征图通道数相同
-        """
-        # 提取各层特征
-        c3, c4, c5 = features['0'], features['1'], features['2']
-        
-        # 自上而下的特征融合
-        p5 = self.lateral_convs[2](c5)  # 最顶层
-        
-        # p4 = c4 + 上采样的p5
-        p4 = self.lateral_convs[1](c4) + F.interpolate(
-            p5, size=c4.shape[-2:], mode='nearest'
-        )
-        
-        # p3 = c3 + 上采样的p4  
-        p3 = self.lateral_convs[0](c3) + F.interpolate(
-            p4, size=c3.shape[-2:], mode='nearest'
-        )
-        
-        # 融合卷积细化特征
-        p3 = self.fusion_convs[0](p3)
-        p4 = self.fusion_convs[1](p4)
-        p5 = self.fusion_convs[2](p5)
-        
-        return {'0': p3, '1': p4, '2': p5}
 
 
 def build_backbone(config: BackboneConfig):

@@ -1,0 +1,57 @@
+data:
+  color_jitter_prob: 0.5
+  dataset_root: datasets/RGBT-Tiny
+  horizontal_flip_prob: 0.5
+  image_mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  image_size:
+  - 512
+  - 640
+  image_std:
+  - 0.229
+  - 0.224
+  - 0.225
+  max_scale: 1.2
+  min_scale: 0.8
+  num_classes: 7
+  small_target_augmentation: true
+  train_annotation: annotations_coco/instances_00_train2017.json
+  use_augmentation: true
+  val_annotation: annotations_coco/instances_00_test2017.json
+loss:
+  cost_bbox: 5.0
+  cost_class: 1.0
+  cost_giou: 2.0
+  eos_coef: 0.1
+  weight_bbox: 5.0
+  weight_class: 1.0
+  weight_giou: 2.0
+model:
+  backbone: resnet50
+  dim_feedforward: 256
+  dropout: 0.1
+  hidden_dim: 128
+  nheads: 4
+  num_classes: 7
+  num_decoder_layers: 2
+  num_encoder_layers: 2
+  num_feature_levels: 1
+  num_queries: 20
+training:
+  batch_size: 1
+  checkpoint_interval: 5
+  clip_max_norm: 0.1
+  device: cuda
+  epochs: 10
+  lr: 1.0e-05
+  min_delta: 0.001
+  num_workers: 2
+  output_dir: outputs
+  patience: 5
+  resume: ''
+  scheduler: cosine
+  seed: 42
+  warmup_epochs: 2
+  weight_decay: 0.0001
