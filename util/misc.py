@@ -1,6 +1,5 @@
-# util/misc.py
 """
-工具函数 - 修复版本
+工具函数 - 修复版本，添加缺少的方法
 """
 
 import time
@@ -71,7 +70,7 @@ class SmoothedValue:
 
 
 class MetricLogger:
-    """指标记录器"""
+    """指标记录器 - 修复版本，添加缺少的方法"""
     
     def __init__(self, delimiter="\t"):
         self.meters = {}
@@ -88,6 +87,8 @@ class MetricLogger:
     def __getattr__(self, attr):
         if attr in self.meters:
             return self.meters[attr]
+        if attr == 'synchronize_between_processes':
+            return self.synchronize_between_processes
         return object.__getattribute__(self, attr)
     
     def __str__(self):
@@ -112,11 +113,17 @@ class MetricLogger:
         
         log_msg = [
             header,
+            '[{0' + space_fmt + '}/{1}]',
+            'eta: {eta}',
             '{meters}',
-            'data_time: {data_time}',
-            'iter_time: {iter_time}'
+            'time: {time}',
+            'data: {data}'
         ]
+        if torch.cuda.is_available():
+            log_msg.append('max mem: {memory:.0f}')
         log_msg = self.delimiter.join(log_msg)
+        
+        MB = 1024.0 * 1024.0
         
         for obj in iterable:
             data_time.update(time.time() - end)
@@ -124,17 +131,30 @@ class MetricLogger:
             iter_time.update(time.time() - end)
             
             if i % print_freq == 0 or i == len(iterable) - 1:
-                print(log_msg.format(
-                    meters=str(self),
-                    data_time=str(data_time),
-                    iter_time=str(iter_time)
-                ))
+                eta_seconds = iter_time.global_avg * (len(iterable) - i)
+                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                if torch.cuda.is_available():
+                    print(log_msg.format(
+                        i, len(iterable), eta=eta_string,
+                        meters=str(self),
+                        time=str(iter_time), data=str(data_time),
+                        memory=torch.cuda.max_memory_allocated() / MB))
+                else:
+                    print(log_msg.format(
+                        i, len(iterable), eta=eta_string,
+                        meters=str(self),
+                        time=str(iter_time), data=str(data_time)))
             i += 1
             end = time.time()
         
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print(f'{header} Total time: {total_time_str}')
+        print(f'{header} Total time: {total_time_str} ({(total_time / len(iterable)):.4f} s / it)')
+    
+    def synchronize_between_processes(self):
+        """在不同进程间同步所有meter"""
+        for meter in self.meters.values():
+            meter.synchronize_between_processes()
 
 
 def reduce_dict(input_dict, average=True):
@@ -200,3 +220,39 @@ def load_checkpoint(model, optimizer, scheduler, filename, device):
     
     print(f"Checkpoint loaded: {filename}, epoch: {checkpoint['epoch']}")
     return checkpoint['epoch']
+
+
+def all_gather(data):
+    """从所有进程收集数据"""
+    world_size = get_world_size()
+    if world_size == 1:
+        return [data]
+
+    # 序列化数据
+    buffer = pickle.dumps(data)
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to("cuda")
+
+    # 获取张量大小
+    local_size = torch.tensor([tensor.numel()], device="cuda")
+    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    size_list = [int(size.item()) for size in size_list]
+    max_size = max(size_list)
+
+    # 填充张量
+    tensor_list = []
+    for _ in size_list:
+        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
+    if local_size < max_size:
+        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+        tensor = torch.cat((tensor, padding), dim=0)
+    dist.all_gather(tensor_list, tensor)
+
+    # 反序列化数据
+    data_list = []
+    for size, tensor in zip(size_list, tensor_list):
+        buffer = tensor.cpu().numpy().tobytes()[:size]
+        data_list.append(pickle.loads(buffer))
+
+    return data_list

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ThermalTracker 主训练脚本 - 完整修复版本
+ThermalTracker 主训练脚本 - 修复导入问题版本
 """
 
 import os
@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import warnings
+
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
@@ -18,7 +19,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from datasets import build_infrared_dataset, collate_fn
 from models import DeformableDETR, SetCriterion, HungarianMatcher
-from engine import train_one_epoch, evaluate, EarlyStopping
+from engine.train import train_one_epoch, evaluate  # 明确从engine.train导入函数
+from engine.train import EarlyStopping  # 明确从engine.train导入EarlyStopping
 from util import create_optimizer, create_scheduler, save_checkpoint, load_checkpoint
 from util.motdet_eval import InfraredSmallTargetEvaluator
 from config import get_config, save_config
@@ -155,7 +157,7 @@ def build_dataloaders(train_dataset, val_dataset, config):
 
 
 def train(config):
-    """主训练函数 - 最终修复版本"""
+    """主训练函数 - 修复导入问题版本"""
     print("=" * 60)
     print("ThermalTracker Training Started")
     print("=" * 60)
@@ -187,7 +189,7 @@ def train(config):
     
     scheduler = create_scheduler(optimizer, config)
     
-    # 早停机制 - 修复：正确初始化
+    # 早停机制
     early_stopping = EarlyStopping(
         patience=config.training.patience,
         min_delta=config.training.min_delta
@@ -197,7 +199,7 @@ def train(config):
     os.makedirs(config.training.output_dir, exist_ok=True)
     save_config(config, os.path.join(config.training.output_dir, 'config.yaml'))
     
-    # 训练循环 - 修复：正确使用早停机制
+    # 训练循环
     print("\nStarting training...")
     best_val_loss = float('inf')
     
@@ -212,7 +214,7 @@ def train(config):
                 device, epoch, config.training.clip_max_norm
             )
             
-            # 验证
+            # 验证 - 现在evaluate是函数而不是模块
             val_stats = evaluate(model, criterion, val_loader, device)
             val_loss = val_stats['loss']
             
@@ -239,8 +241,8 @@ def train(config):
                     model, optimizer, scheduler, epoch, config, checkpoint_path
                 )
             
-            # 早停检查 - 修复：正确调用
-            if early_stopping(val_loss):
+            # 早停检查
+            if early_stopping(model, val_loss):
                 print(f"Early stopping at epoch {epoch + 1}")
                 print(f"Status: {early_stopping.status}")
                 break
@@ -258,7 +260,7 @@ def train(config):
                 break
             continue
     
-    # 恢复最佳模型权重 - 修复：正确调用
+    # 恢复最佳模型权重
     early_stopping.restore_best_weights(model)
     
     # 保存最终模型
